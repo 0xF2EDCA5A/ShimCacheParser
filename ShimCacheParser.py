@@ -17,16 +17,20 @@
 #
 # Identifies and parses Application Compatibility Shim Cache entries for forensic data.
 
+import os
+import csv
 import sys
 import struct
+import logging
 import zipfile
 import argparse
 import binascii
 import datetime
 import cStringIO as sio
-import xml.etree.cElementTree as et
 from os import path
 from csv import writer
+from optparse import OptionParser
+import xml.etree.cElementTree as et
 
 # Values used by Windows 5.2 and 6.0 (Server 2003 through Vista/Server 2008)
 CACHE_MAGIC_NT5_2 = 0xbadc0ffe
@@ -54,9 +58,26 @@ WIN8_MAGIC = '00ts'
 # Magic value used by Windows 8.1
 WIN81_MAGIC = '10ts'
 
-bad_entry_data = 'N/A'
-g_verbose = False
-output_header  = ["Last Modified", "Last Update", "Path", "File Size", "Exec Flag"]
+G_BAD_ENTRY_DATA = 'N/A'
+G_VERBOSE = False
+G_OUTPUT_HEADER = ["Hostname", "Order", "Last Modified", "Last Update", "Path", "File Size", "Exec Flag",]
+
+# setup logging
+log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                               '%Y-%m-%d %H:%M:%S')
+
+logfile = logging.FileHandler("%s.log" % os.path.splitext(__file__)[0])
+logfile.setLevel(logging.INFO)
+logfile.setFormatter(log_format)
+
+stdout = logging.StreamHandler(sys.stdout)
+stdout.setLevel(logging.INFO)
+stdout.setFormatter(log_format)
+
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+log.addHandler(logfile)
+log.addHandler(stdout)
 
 # Shim Cache format used by Windows 5.2 and 6.0 (Server 2003 through Vista/Server 2008)
 class CacheEntryNt5(object):
@@ -119,7 +140,55 @@ class CacheEntryNt6(object):
             return NT6_1_ENTRY_SIZE32
         else:
             return NT6_1_ENTRY_SIZE64
-    
+
+#########
+#Attempt to extract hostname from filename
+#########
+def get_mir_host_name(file_path):
+    """
+    Get the host name, host am cert hash, and audit type from the MIR file
+    name in the provided file path. MIR audit filenames have the following
+    format:
+
+        <HOSTNAME>-<AMCERTHASH>-<HOSTPARTICLEID>-<DOCPARTICLEID>_<audittype>.xml
+    """
+    file_name = os.path.basename(file_path)
+
+    # use rsplit in event that hostname contains '_'
+    file_name_parts = file_name.rsplit('_', 1)
+    if len(file_name_parts) != 2:
+        return '', ''
+
+    # hostnames may contain '-', so there could be > 4 fields
+    fields, audit_type = file_name_parts
+    fields = fields.split('-')
+    if len(fields) < 4:
+        return '', ''
+
+    # if hostname contained '-', rejoin hostname fields
+    host_name = '-'.join(fields[:-3] or [])
+    host_hash  = fields[-3]
+
+    return (host_name, host_hash)
+
+################
+# Usage
+################
+def usage():
+    print \
+        """
+Input Options:
+    -h, --help              Displays this message
+    -b, --bin=BIN_FILE      Reads Shim Cache data from a binary BIN_FILE
+    -m, --mir=XML           Reads Shim Cache data from a MIR XML file
+    -z, --zip=ZIP_FILE      Reads ZIP_FILE containing MIR registry acquisitions
+    -i, --hive=REG_HIVE     Reads Shim Cache data from a registry REG_HIVE
+    -r, --reg=REG_FILE      Reads Shim Cache data from a .reg Registry export file
+    -l, --local             Reads Shim Cache data from local system
+Output Options:
+    -o, --outfile=FILE      Writes to CSV data to FILE (default is STDOUT)
+    -v, --verbose           Toggles verbose output"""
+
 # Convert FILETIME to datetime.
 # Based on http://code.activestate.com/recipes/511425-filetime-to-datetime/
 def convert_filetime(dwLowDateTime, dwHighDateTime):
@@ -142,29 +211,41 @@ def unique_list(li):
             ret_list.append(entry)
     return ret_list
 
+################
 # Write the Log.
-def write_it(rows, outfile=None):
-    
+################
+def write_it(rows, outfile=None, append=False, host_name='N/A', print_header=True):
+    global G_OUTPUT_HEADER
     try:
-        
         if not rows:
-            print "[-] No data to write..."
+            log.debug("No data to write...")
             return
-        
-        if not outfile:
-            for row in rows:
-                print " ".join(["%s"%x for x in row])
-        else:
-            print "[+] Writing output to %s..."%outfile
-            try:    
-                csv_writer = writer(file(outfile, 'wb'), delimiter=',')
-                csv_writer.writerows(rows)
-            except IOError, err:
-                print "[-] Error writing output file: %s" % str(err)
-                return
+
+        if G_VERBOSE:
+            G_OUTPUT_HEADER += ["Key Path"]
+
+        new_rows = [] 
+        if print_header:
+            new_rows = [G_OUTPUT_HEADER]
             
+        for idx, row in enumerate(rows):
+            new_rows.append([host_name, idx] + row)
+
+        if outfile == None:
+            for row in new_rows:
+                log.info(" ".join(["%s" % x for x in row]))
+        else:
+            try:
+                mode = 'wb'
+                if append:
+                    mode = 'ab'
+                writer = csv.writer(file(outfile, mode), delimiter=',')
+                writer.writerows(new_rows)
+            except IOError, err:
+                log.error("Error writing output file: %s" % str(err))
+                return
     except UnicodeEncodeError, err:
-        print "[-] Error writing output file: %s" % str(err)
+        log.error("Error writing output file: %s" % str(err))
         return
     
 # Read the Shim Cache format, return a list of last modified dates/paths.
@@ -172,7 +253,8 @@ def read_cache(cachebin, quiet=False):
     
     if len(cachebin) < 16:
         # Data size less than minimum header size.
-        return None
+        log.error("Cache size less than minimum header size (16)")
+        return []
     
     try:        
         # Get the format type
@@ -190,14 +272,14 @@ def read_cache(cachebin, quiet=False):
             if (test_max_size-test_size == 2 and
                 struct.unpack("<L", cachebin[12:16])[0] ) == 0:
                 if not quiet:
-                    print "[+] Found 64bit Windows 2k3/Vista/2k8 Shim Cache data..."
+                    log.debug("Found 64bit Windows 2k3/Vista/2k8 Shim Cache data...")
                 entry = CacheEntryNt5(False)
                 return read_nt5_entries(cachebin, entry)
                 
             # Otherwise it's 32-bit data.
             else:
                 if not quiet:
-                    print "[+] Found 32bit Windows 2k3/Vista/2k8 Shim Cache data..."
+                    log.debug("Found 32bit Windows 2k3/Vista/2k8 Shim Cache data...")
                 entry = CacheEntryNt5(True)
                 return read_nt5_entries(cachebin, entry)
 
@@ -217,40 +299,40 @@ def read_cache(cachebin, quiet=False):
                 struct.unpack("<L", cachebin[CACHE_HEADER_SIZE_NT6_1+4:
                 CACHE_HEADER_SIZE_NT6_1 + 8])[0] ) == 0:
                 if not quiet:
-                    print "[+] Found 64bit Windows 7/2k8-R2 Shim Cache data..."
+                    log.debug("Found 64bit Windows 7/2k8-R2 Shim Cache data...")
                 entry = CacheEntryNt6(False)
                 return read_nt6_entries(cachebin, entry)
             else:
                 if not quiet:
-                    print "[+] Found 32bit Windows 7/2k8-R2 Shim Cache data..."
+                    log.debug("Found 32bit Windows 7/2k8-R2 Shim Cache data...")
                 entry = CacheEntryNt6(True)
                 return read_nt6_entries(cachebin, entry)
 
         # This is WinXP cache data
         elif magic == WINXP_MAGIC32:
             if not quiet:
-                print "[+] Found 32bit Windows XP Shim Cache data..."
+                log.debug("Found 32bit Windows XP Shim Cache data...")
             return read_winxp_entries(cachebin)
         
         # Check the data set to see if it matches the Windows 8 format.
         elif len(cachebin) > WIN8_STATS_SIZE and cachebin[WIN8_STATS_SIZE:WIN8_STATS_SIZE+4] == WIN8_MAGIC:
             if not quiet:
-                print "[+] Found Windows 8/2k12 Apphelp Cache data..."
+                log.debug("Found Windows 8/2k12 Apphelp Cache data...")
             return read_win8_entries(cachebin, WIN8_MAGIC)
 
         # Windows 8.1 will use a different magic dword, check for it
         elif len(cachebin) > WIN8_STATS_SIZE and cachebin[WIN8_STATS_SIZE:WIN8_STATS_SIZE+4] == WIN81_MAGIC:
             if not quiet:
-                print "[+] Found Windows 8.1 Apphelp Cache data..."
+                log.debug("Found Windows 8.1 Apphelp Cache data...")
             return read_win8_entries(cachebin, WIN81_MAGIC)
 
         else:
-            print "[-] Got an unrecognized magic value of 0x%x... bailing" % magic
-            return None
+            log.error("Got an unrecognized magic value of 0x%x... bailing" % magic)
+            return []
  
     except (RuntimeError, TypeError, NameError), err:
-        print "[-] Error reading Shim Cache data: %s" % err
-        return None
+        log.error("Error reading Shim Cache data: %s" % err)
+        return []
 
 # Read Windows 8/2k12/8.1 Apphelp Cache entry formats.
 def read_win8_entries(bin_data, ver_magic):
@@ -298,9 +380,9 @@ def read_win8_entries(bin_data, ver_magic):
 
         last_mod_date = convert_filetime(low_datetime, high_datetime)
         try:
-            last_mod_date = last_mod_date.strftime("%m/%d/%y %H:%M:%S")
+            last_mod_date = last_mod_date.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
-            last_mod_date = bad_entry_data
+            last_mod_date = G_BAD_ENTRY_DATA
 
         row = [last_mod_date, 'N/A', path, 'N/A', exec_flag]
         entry_list.append(row)
@@ -318,7 +400,7 @@ def read_nt5_entries(bin_data, entry):
         
         num_entries = struct.unpack('<L', bin_data[4:8])[0]
         if num_entries == 0:
-            return None
+            return []
         
         # On Windows Server 2008/Vista, the filesize is swapped out of this
         # structure with two 4-byte flags. Check to see if any of the values in
@@ -340,9 +422,9 @@ def read_nt5_entries(bin_data, entry):
         
             last_mod_date = convert_filetime(entry.dwLowDateTime, entry.dwHighDateTime)
             try:
-                last_mod_date = last_mod_date.strftime("%m/%d/%y %H:%M:%S")
+                last_mod_date = last_mod_date.strftime("%Y-%m-%d %H:%M:%S")
             except ValueError:
-                last_mod_date = bad_entry_data
+                last_mod_date = G_BAD_ENTRY_DATA
             path = bin_data[entry.Offset:entry.Offset + entry.wLength].decode('utf-16le', 'replace').encode('utf-8')
             path = path.replace("\\??\\", "")
             
@@ -367,8 +449,8 @@ def read_nt5_entries(bin_data, entry):
         return entry_list
     
     except (RuntimeError, ValueError, NameError), err:
-        print "[-] Error reading Shim Cache data: %s..." % err
-        return None
+        log.error("Error reading Shim Cache data: %s..." % err)
+        return []
         
 # Read the Shim Cache Windows 7/2k8-R2 entry format,
 # return a list of last modifed dates/paths.
@@ -381,7 +463,7 @@ def read_nt6_entries(bin_data, entry):
         num_entries = struct.unpack('<L', bin_data[4:8])[0]
         
         if num_entries == 0:
-            return None
+            return []
     
         # Walk each entry in the data structure. 
         for offset in xrange(CACHE_HEADER_SIZE_NT6_1,
@@ -392,7 +474,7 @@ def read_nt6_entries(bin_data, entry):
             last_mod_date = convert_filetime(entry.dwLowDateTime,
                                              entry.dwHighDateTime)
             try:
-                last_mod_date = last_mod_date.strftime("%m/%d/%y %H:%M:%S")
+                last_mod_date = last_mod_date.strftime("%Y-%m-%d %H:%M:%S")
             except ValueError:
                 last_mod_date = 'N/A'
             path = (bin_data[entry.Offset:entry.Offset +
@@ -412,8 +494,8 @@ def read_nt6_entries(bin_data, entry):
         return entry_list
     
     except (RuntimeError, ValueError, NameError), err:
-        print '[-] Error reading Shim Cache data: %s...' % err
-        return None
+        log.error("Error reading Shim Cache data: %s...' % err")
+        return []
 
 # Read the WinXP Shim Cache data. Some entries can be missing data but still
 # contain useful information, so try to get as much as we can.
@@ -425,7 +507,7 @@ def read_winxp_entries(bin_data):
         
         num_entries = struct.unpack('<L', bin_data[8:12])[0]
         if num_entries == 0:
-            return None
+            return []
         
         for offset in xrange(WINXP_HEADER_SIZE32,
                              (num_entries*WINXP_ENTRY_SIZE32), WINXP_ENTRY_SIZE32):
@@ -448,22 +530,22 @@ def read_winxp_entries(bin_data):
             last_mod_time = struct.unpack('<2L', bin_data[entry_data:entry_data+8])
             try:
                 last_mod_time = convert_filetime(last_mod_time[0],
-                                                 last_mod_time[1]).strftime("%m/%d/%y %H:%M:%S")
+                                                 last_mod_time[1]).strftime("%Y-%m-%d %H:%M:%S")
             except ValueError:
                 last_mod_time = 'N/A'
                 
             # Get last file size.
             file_size = struct.unpack('<2L', bin_data[entry_data + 8:entry_data + 16])[0]
             if file_size == 0:
-                file_size = bad_entry_data
+                file_size = G_BAD_ENTRY_DATA
             
             # Get last update time.
             exec_time = struct.unpack('<2L', bin_data[entry_data + 16:entry_data + 24])
             try:
                 exec_time = convert_filetime(exec_time[0],
-                                             exec_time[1]).strftime("%m/%d/%y %H:%M:%S")
+                                             exec_time[1]).strftime("%Y-%m-%d %H:%M:%S")
             except ValueError:
-                exec_time = bad_entry_data
+                exec_time = G_BAD_ENTRY_DATA
                 
             hit = [last_mod_time, exec_time, path, file_size, 'N/A']
             if hit not in entry_list:
@@ -471,8 +553,8 @@ def read_winxp_entries(bin_data):
         return entry_list
     
     except (RuntimeError, ValueError, NameError), err:
-        print "[-] Error reading Shim Cache data %s" % err
-        return None
+        log.error("Error reading Shim Cache data %s" % err)
+        return []
 
 # Get Shim Cache data from a registry hive.
 def read_from_hive(hive):
@@ -483,13 +565,13 @@ def read_from_hive(hive):
     try:
         from Registry import Registry
     except ImportError:
-        print "[-] Hive parsing requires Registry.py... Didn\'t find it, bailing..."
+        log.error("Hive parsing requires Registry.py... Didn\'t find it, bailing...")
         sys.exit(2)
         
     try:
         reg = Registry.Registry(hive)
     except Registry.RegistryParse.ParseException, err:
-        print "[-] Error parsing %s: %s" % (hive, err)
+        log.error("Error parsing %s: %s" % (hive, err))
         sys.exit(1)
         
     root = reg.root().subkeys()
@@ -505,28 +587,24 @@ def read_from_hive(hive):
                         bin_data = str(subkey['AppCompatCache'].value())
                         tmp_list = read_cache(bin_data)
                         
-                        if tmp_list:
-                            for row in tmp_list:
-                                if g_verbose:
-                                    row.append(subkey.path())
-                                if row not in out_list:
-                                    out_list.append(row)
+                        for row in tmp_list:
+
+                            if G_VERBOSE:
+                                row.append(subkey.path())
+                            if row not in out_list:
+                                out_list.append(row)
 
         except Registry.RegistryKeyNotFoundException:
             continue
         
     if len(out_list) == 0:
-        return None
+        return []
     else:
-        # Add the header and return the list including duplicates.
-        if g_verbose:
-            out_list.insert(0, output_header + ['Key Path'])
-            return out_list
-        else:
-        # Only return unique entries.
+        # if not verbose, attempt to make list unique
+        if not G_VERBOSE:
             out_list = unique_list(out_list)
-            out_list.insert(0, output_header)
-            return out_list
+
+        return out_list
             
 # Get Shim Cache data from MIR registry output file.
 def read_mir(xml_file, quiet=False):
@@ -541,43 +619,43 @@ def read_mir(xml_file, quiet=False):
             
             path_name = reg_item.find("Path").text
             if not path_name:
-                print "[-] Error XML missing Path"
+                log.error("Error XML missing Path")
                 print et.tostring(reg_item)
                 reg_item.clear()
                 continue
+
             path_name = path_name.lower()
 
             # Check to see that we have the right registry value.
             if 'control\\session manager\\appcompatcache\\appcompatcache' in path_name \
                 or 'control\\session manager\\appcompatibility\\appcompatcache' in path_name:
+
                 # return the base64 decoded value data.
                 bin_data = binascii.a2b_base64(reg_item.find('Value').text)
                 tmp_list = read_cache(bin_data, quiet)
-                
-                if tmp_list:
-                    for row in tmp_list:
-                        if g_verbose:
-                            row.append(path_name)
-                        if row not in out_list:
-                            out_list.append(row)
+               
+                for row in tmp_list:
+
+                    if G_VERBOSE:
+                        row.append(path_name)
+
+                    if row not in out_list:
+                        out_list.append(row)
+
             reg_item.clear()
                     
     except (AttributeError, TypeError, IOError),  err:
-        print "[-] Error reading MIR XML: %s" % str(err)
-        return None
+        log.error("Error reading MIR XML: %s" % str(err))
+        return []
     
     if len(out_list) == 0:
-        return None
+        return []
     else:
-        # Add the header and return the list.
-        if g_verbose:
-            out_list.insert(0, output_header + ['Key Path'])
-            return out_list
-        else:
-        # Only return unique entries.
+        # if not verbose, attempt to make list unique
+        if not G_VERBOSE:
             out_list = unique_list(out_list)
-            out_list.insert(0, output_header)
-            return out_list
+
+        return out_list
         
 # Get Shim Cache data from .reg file.
 # Finds the first key named "AppCompatCache" and parses the
@@ -587,7 +665,7 @@ def read_from_reg(reg_file, quiet=False):
     out_list = []
 
     if not path.exists(reg_file):
-        return None
+        return []
     
     f = open(reg_file, 'rb')
     file_contents = f.read()
@@ -598,8 +676,8 @@ def read_from_reg(reg_file, quiet=False):
         pass #.reg file should be UTF-16, if it's not, it might be ANSI, which is not fully supported here.
 
     if not file_contents.startswith('Windows Registry Editor'):
-        print "[-] Unable to properly decode .reg file: %s" % reg_file
-        return None
+        log.error("Unable to properly decode .reg file: %s" % reg_file)
+        return []
 
     path_name = None
     relevant_lines = []
@@ -621,12 +699,11 @@ def read_from_reg(reg_file, quiet=False):
             bin_data = binascii.unhexlify(hex_str)
             tmp_list = read_cache(bin_data, quiet)
 
-            if tmp_list:
-                for row in tmp_list:
-                    if g_verbose:
-                        row.append(path_name)
-                    if row not in out_list:
-                        out_list.append(row)
+            for row in tmp_list:
+                if G_VERBOSE:
+                    row.append(path_name)
+                if row not in out_list:
+                    out_list.append(row)
 
             # reset variables for next block
             found_appcompat = False
@@ -635,33 +712,29 @@ def read_from_reg(reg_file, quiet=False):
             break
 
     if appcompat_keys <= 0:
-        print "[-] Unable to find value in .reg file: %s" % reg_file
-        return None
+        log.error("Unable to find value in .reg file: %s" % reg_file)
+        return []
 
     if len(out_list) == 0:
-        return None
+        return []
     else:
         # Add the header and return the list.
-        if g_verbose:
-            out_list.insert(0, output_header + ['Key Path'])
-            return out_list
-        else:
-        # Only return unique entries.
+        if not G_VERBOSE:
             out_list = unique_list(out_list)
-            out_list.insert(0, output_header)
-            return out_list
+
+        return out_list
 
 # Acquire the current system's Shim Cache data.
 def get_local_data():
     
     tmp_list = []
     out_list = []
-    global g_verbose    
+    global G_VERBOSE    
 
     try:
         import _winreg as reg
     except ImportError:
-        print "[-] \'winreg.py\' not found... Is this a Windows system?"
+        log.error("\'winreg.py\' not found... Is this a Windows system?")
         sys.exit(1)
         
     hReg = reg.ConnectRegistry(None, reg.HKEY_LOCAL_MACHINE)
@@ -685,7 +758,7 @@ def get_local_data():
                             if tmp_list:
                                 path_name = 'SYSTEM\\%s\\Control\\Session Manager\\%s' % (control_name, subkey_name)
                                 for row in tmp_list:
-                                    if g_verbose:
+                                    if G_VERBOSE:
                                         row.append(path_name)
                                     if row not in out_list:
                                         out_list.append(row)
@@ -698,23 +771,19 @@ def get_local_data():
         return None
     else:
         #Add the header and return the list.
-        if g_verbose:
-            out_list.insert(0, output_header + ['Key Path'])
-            return out_list
-        else:
-        #Only return unique entries.
+        if not G_VERBOSE:
             out_list = unique_list(out_list)
-            out_list.insert(0, output_header)
-            return out_list
+
+        return out_list
 
 # Read a MIR XML zip archive.
-def read_zip(zip_name):
+def read_zip(zip_name, output_file, processed_hosts):
     
     zip_contents = []
-    tmp_list = []
-    final_list = []
-    out_list = []
-    hostname = ""
+    tmp_list     = []
+    final_list   = []
+    out_list     = []
+    files_parsed = 0
     
     try:
         # Open the zip archive.
@@ -722,141 +791,182 @@ def read_zip(zip_name):
         for zip_file in archive.infolist():
             zip_contents.append(zip_file.filename)
         
-        print "[+] Processing %d registry acquisitions..." % len(zip_contents)
+        log.info("Processing %d registry acquisitions..." % len(zip_contents))
         for item in zip_contents:
             try:
                 if '_w32registry.xml' not in item:
                     continue
-                filename = item.split('/')
-                if len(filename) > 0:
-                    filename = filename.pop()
-                else:
+
+                host_name, host_hash = get_mir_host_name(item)
+                if host_hash in processed_hosts:
+                    log.warning("Skipping duplicate host %s (%s)" % (host_name, host_hash))
                     continue
-                # Get the hostname from the MIR xml filename.
-                hostname = '-'.join(filename.split('-')[:-3])
+
                 xml_file = archive.open(item)
                 
                 # Catch possibly corrupt MIR XML data.
                 try:
                     out_list = read_mir(xml_file, quiet=True)
                 except(struct.error, et.ParseError), err:
-                    print "[-] Error reading XML data from host: %s, data looks corrupt. Continuing..." % hostname
+                    log.error("Error reading XML data from host: %s, data looks corrupt. Continuing..." % hostname)
                     continue
-                    
-                # Add the hostname to the entry list.
-                if not out_list or len(out_list) == 0:
+
+                #Add the hostname to the entry list.
+                if len(out_list) == 0:
+                    log.warning("Processing failed for '%s'. No Shim Cache entries found." % (item))
                     continue
                 else:
-                    for li in out_list:
-                        if "Last Modified" not in li[0]:
-                            li.insert(0, hostname)
-                            final_list.append(li)
+                    files_parsed += 1
+                    write_it(out_list, 
+                             output_file, 
+                             append       = (files_parsed > 1), 
+                             host_name    = host_name, 
+                             print_header = (files_parsed == 1))
+                    
+                xml_file.close()
 
             except IOError, err:
-                print "[-] Error opening file: %s in MIR archive: %s" % (item, err)
+                log.error("Error opening file: %s in MIR archive: %s" % (item, err))
                 continue
-        # Add the final header.
-        final_list.insert(0, ("Hostname", "Last Modified", "Last Execution",
-                              "Path", "File Size", "File Executed", "Key Path"))
-        return final_list
+
+        return processed_hosts
         
     except (IOError, zipfile.BadZipfile, struct.error), err:
-        print "[-] Error reading zip archive: %s" % zip_name
-        return None
+        log.error("Error reading zip archive: %s" % zip_name)
+        return processed_hosts
 
 # Do the work.
 def main():
     
-    global g_verbose
+    global G_VERBOSE
     
-    parser = argparse.ArgumentParser(description="Parses Application Compatibilty Shim Cache data")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Toggles verbose output")
-    
-    group = parser.add_argument_group()
-    group.add_argument("-o", "--out", metavar="FILE", help="Writes to CSV data to FILE (default is STDOUT)")
-    
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("-l", "--local", action="store_true", help="Reads data from local system")
-    group.add_argument("-b", "--bin", metavar="BIN", help="Reads data from a binary BIN file")
-    group.add_argument("-m", "--mir", metavar="XML", help="Reads data from a MIR XML file")
-    group.add_argument("-z", "--zip", metavar="ZIP", help="Reads ZIP file containing MIR registry acquisitions")
-    group.add_argument("-i", "--hive", metavar="HIVE", help="Reads data from a registry reg HIVE")
-    group.add_argument("-r", "--reg", metavar="REG", help="Reads data from a .reg registry export file")
+    dscr  = "Parses Application Compatibilty Shim Cache data"
+    usage = "\r\n\t%prog -[lbmzir] <input_file_or_dir> -o <output_file>"
 
-    args = parser.parse_args()
+    parser = OptionParser(usage=usage, description=dscr)
+   
+    parser.add_option("-l", "--local",    action="store_true", help="Reads data from local system")
+    parser.add_option("-b", "--bin",      default=None,        help="Reads data from a binary BIN file (or dir of BIN files)")
+    parser.add_option("-m", "--mir",      default=None,        help="Reads data from a MIR XML file (or dir of MIR XML files)")
+    parser.add_option("-z", "--zip",      default=None,        help="Reads ZIP file containing MIR registry acquisitions (or dir of MIR ZIP files)")
+    parser.add_option("-i", "--hive",     default=None,        help="Reads data from a registry reg HIVE (or dir of HIVE files)")
+    parser.add_option("-r", "--reg",      default=None,        help="Reads data from a .reg registry export file")
+    parser.add_option("-n", "--hostname", default=None,        help="Manually specify the hostname to include in the output file")
+    parser.add_option("-o", "--out",      dest='output_file',  help="Writes to CSV data to FILE (default is STDOUT)")
+    parser.add_option("-v", "--verbose",  action="store_true", help="Include registry key path in output")
+    parser.add_option("-d", "--debug",    action="store_true", help="Toggles debug output messages")
 
-    if args.verbose:
-        g_verbose = True
+    (options, args) = parser.parse_args()
 
-    # Pull Shim Cache MIR XML.
-    if args.mir:
-        print "[+] Reading MIR output XML file: %s..." % args.mir
-        try:
-            with file(args.mir, 'rb') as xml_data:
-                entries = read_mir(xml_data)
-                if not entries:
-                    print "[-] No Shim Cache entries found..."
-                    return 
-                else:
-                    write_it(entries, args.out)
-        except IOError, err:
-            print "[-] Error opening binary file: %s" % str(err)
-            return
+    if options.verbose:
+        G_VERBOSE = True
 
-    # Process a MIR XML ZIP archive
-    elif args.zip:
-        print "[+] Reading MIR XML zip archive: %s..." % args.zip
-        entries = read_zip(args.zip)
-        if not entries:
-            print "[-] No Shim Cache entries found..."
-        else:
-            write_it(entries, args.out)
-        
-    # Read the binary file.
-    elif args.bin:
-        print "[+] Reading binary file: %s..." % args.bin
-        try:
-            with file(args.bin, 'rb') as bin_data:
-                bin_data = bin_data.read()
-        except IOError, err:
-            print "[-] Error opening binary file: %s" % str(err)
-            return
-        entries = read_cache(bin_data)
-        if not entries:
-            print "[-] No Shim Cache entries found..."
-        else:
-            write_it(entries, args.out)
-        
-    # Read the key data from a registry hive.
-    elif args.reg:
-        print "[+] Reading .reg file: %s..." % args.reg
-        entries = read_from_reg(args.reg)
-        if not entries:
-            print "[-] No Shim Cache entries found..."
-        else:
-            write_it(entries, args.out)
-            
-    elif args.hive:
-        print "[+] Reading registry hive: %s..." % args.hive
-        try:
-            entries = read_from_hive(args.hive)
-            if not entries:
-                print "[-] No Shim Cache entries found..."
-            else:
-                write_it(entries, args.out)
-        except IOError, err:
-            print "[-] Error opening hive file: %s" % str(err)
-            return
-            
+    if options.debug:              
+        log.setLevel(logging.DEBUG)      
+        logfile.setLevel(logging.DEBUG)
+        stdout.setLevel(logging.DEBUG)
+
     # Read the local Shim Cache data from the current system
-    elif args.local:
-        print "[+] Dumping Shim Cache data from the current system..."
+    if options.local:
+        log.info("Dumping Shim Cache data from the current system...")
         entries = get_local_data()
         if not entries:
-            print "[-] No Shim Cache entries found..."
+            log.error("No Shim Cache entries found...")
         else:
-            write_it(entries, args.out)
+            write_it(entries, options.output_file)
+    else:
+
+        input_path = options.bin or options.mir or options.zip or options.hive or options.reg
+        if not input_path:
+            parser.error('You must specify the type of file(s) to process.')
+
+        # parse input path, which can be a directory or a file
+        file_paths = set()
+        append = False
+        if os.path.isdir(input_path):
+            for root, dirs, files in os.walk(input_path):
+                log.debug("Found directory '%s'" % root)
+                file_paths.update(map(lambda f: os.path.join(root, f), files))
+    
+            append = True
+        else:
+            file_paths.add(input_path)
+
+        # count of files parsed and unique hosts
+        files_parsed = 0
+        processed_hosts = set()
+
+        # loop over input paths
+        for file_path in file_paths:
+
+            # Pull Shim Cache MIR XML.
+            if options.mir:
+                log.info("Reading MIR output XML file: %s..." % file_path)
+                host_name, host_hash = get_mir_host_name(file_path)
+
+                if host_hash in processed_hosts:
+                    log.warning("Skipping duplicate host %s (%s)" % (host_name, host_hash))
+                    continue
+
+                try:
+                    with file(file_path, 'rb') as xml_data:
+                        entries = read_mir(xml_data)
+                        if len(entries) <= 0:
+                            log.error("No Shim Cache entries found...")
+                        else:
+                            files_parsed += 1
+                            processed_hosts.update((host_hash,))
+                            write_it(entries, 
+                                     options.output_file, 
+                                     append       = (files_parsed > 1), 
+                                     host_name    = host_name, 
+                                     print_header = (files_parsed == 1))
+
+                except IOError, err:
+                    log.error("Error opening binary file: %s" % str(err))
         
+            # Process a MIR XML ZIP archive
+            elif options.zip:
+                log.info("Reading MIR XML zip archive: %s..." % file_path)
+                entries = read_zip(file_path, options.output_file, processed_hosts)
+                
+            # Read the binary file.
+            elif options.bin:
+                log.info("Reading binary file: %s..." % file_path)
+                try:
+                    with file(file_path, 'rb') as bin_data:
+                        bin_data = bin_data.read()
+                except IOError, err:
+                    log.error("Error opening binary file: %s" % str(err))
+                    continue
+
+                entries = read_cache(bin_data)
+                if len(entries) == 0:
+                    log.error("No Shim Cache entries found...")
+                else:
+                    write_it(entries, options.output_file, append)
+                
+            # Read the key data from a registry hive.
+            elif options.reg:
+                log.info("Reading .reg file: %s..." % file_path)
+                entries = read_from_reg(file_path)
+                if len(entries) == 0:
+                    log.error("No Shim Cache entries found...")
+                else:
+                    write_it(entries, options.output_file, append)
+                    
+            elif options.hive:
+                log.info("Reading registry hive: %s..." % file_path)
+                try:
+                    entries = read_from_hive(file_path)
+                    if len(entries) == 0:
+                        log.error("No Shim Cache entries found...")
+                    else:
+                        write_it(entries, options.output_file, append)
+
+                except IOError, err:
+                    log.error("Error opening hive file: %s" % str(err))
+                    continue
+
 if __name__ == '__main__':
     main()
